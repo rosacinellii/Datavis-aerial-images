@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Leaflet - Image overlay da CSV (v4)</title>
+
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+
+  <!-- PapaParse (per leggere CSV) -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+
+    .status {
+      position: absolute;
+      z-index: 1000;
+      left: 12px;
+      bottom: 12px;
+      background: rgba(255,255,255,0.92);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font: 13px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      max-width: min(540px, calc(100% - 24px));
+    }
+    .status code { font-size: 12px; }
+
+    /* Bottone "localizza immagine" */
+    .leaflet-bar.locate-image a {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      line-height: 34px;
+      font-size: 18px;
+      text-decoration: none;
+    }
+
+    /* Controllo opacità */
+    .leaflet-control.opacity-slider {
+      background: rgba(255,255,255,0.92);
+      padding: 8px 10px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+    .leaflet-control.opacity-slider .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }
+    .leaflet-control.opacity-slider input[type="range"] {
+      width: 150px;
+    }
+    .leaflet-control.opacity-slider .val {
+      min-width: 3ch;
+      text-align: right;
+      opacity: 0.85;
+    }
+
+    /* Pin "localizzazione" (ancorato correttamente: NESSUN translate qui) */
+    .img-pin {
+      position: relative;
+      width: 28px;
+      height: 28px;
+    }
+    .img-pin .pin {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 18px;
+      height: 18px;
+      border-radius: 50% 50% 50% 0;
+      transform: translate(-50%, -50%) rotate(-45deg);
+      background: #1f78ff;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .img-pin .pin::after {
+      content: "";
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.95);
+      left: 5px;
+      top: 5px;
+    }
+    .img-pin .pulse {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: rgba(31,120,255,0.35);
+      animation: pulse 1.6s ease-out infinite;
+    }
+    @keyframes pulse {
+      0%   { transform: translate(-50%, -50%) scale(0.8); opacity: 0.8; }
+      100% { transform: translate(-50%, -50%) scale(3.2); opacity: 0; }
+    }
+
+    @media (max-width: 520px) {
+      .status {
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        max-width: unset;
+        font-size: 12px;
+      }
+      .leaflet-control.opacity-slider input[type="range"] {
+        width: 120px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <div id="status" class="status">
+    <b>Avvio…</b><br>
+    <span style="opacity:.85">Se il CSV non si carica con doppio click (file://), avvia un server locale (es. <code>python -m http.server</code>).</span>
+  </div>
+
+<script>
+  // === Config ===
+  const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRwWDLOGx5v58dS-6pjShy2BPFwQEHLuir-ji9j13pzUBMUEqo7ve4vr4XVxIZJBhg4uwQS-iY8UdRo/pub?gid=0&single=true&output=csv";
+
+  // Immagine overlay
+  const IMAGE_URL = "overlay.jpg";
+
+  // Vista iniziale (più zoom-out, per vedere l'Europa)
+  const INITIAL_VIEW_CENTER = [54, 15];   // centro Europa circa
+  const INITIAL_VIEW_ZOOM = 4;            // 3-4 = Europa; 5 = più vicino
+  const AUTO_FIT_ON_LOAD = false;         // true = vai subito all'immagine
+
+  // Pin: appare quando l'overlay è molto piccolo (zoom-out)
+  const PIN_SHOW_THRESHOLD_PX = 240;      // soglia (px): se larghezza o altezza overlay < soglia => mostra pin
+  const PIN_ALWAYS_VISIBLE = false;       // true = pin sempre visibile
+
+  // Opacità (slider)
+  const DEFAULT_OPACITY = 0.85;           // valore iniziale slider
+  const OPACITY_STORAGE_KEY = "overlayOpacity"; // persistenza in localStorage
+
+  // Zoom extra quando clicchi pin o bottone ⌖
+  const EXTRA_ZOOM_ON_LOCATE = 1;         // 0 = fit puro, 1 = un po' più vicino
+
+  // Mostra la scala (barra metrica)
+  const SHOW_SCALE_CONTROL = true;
+
+  // --- Colonne coordinate (opzionale) ---
+  const FORCE_LAT_COLUMN = "";
+  const FORCE_LNG_COLUMN = "";
+
+  // === Map base ===
+  const map = L.map("map", {
+    zoomControl: true,
+    zoomSnap: 0.25,
+    zoomDelta: 0.25
+  });
+  map.setView(INITIAL_VIEW_CENTER, INITIAL_VIEW_ZOOM);
+
+  const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 22,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  if (SHOW_SCALE_CONTROL) {
+    L.control.scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 220 }).addTo(map);
+  }
+
+  function setStatus(html) {
+    document.getElementById("status").innerHTML = html;
+  }
+
+  function toNumber(v) {
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    if (!s) return null;
+    const normalized = s.replace(",", ".");
+    const n = Number(normalized);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function pickKeyCI(keys, wanted) {
+    if (!wanted) return null;
+    const w = String(wanted).trim().toLowerCase();
+    if (!w) return null;
+    return keys.find(k => String(k).trim().toLowerCase() === w) || null;
+  }
+
+  function isFiniteLat(n) { return Number.isFinite(n) && Math.abs(n) <= 90; }
+  function isFiniteLng(n) { return Number.isFinite(n) && Math.abs(n) <= 180; }
+
+  function findLatLngFromRow(rowObj) {
+    const keys = Object.keys(rowObj || {});
+    const lower = (k) => String(k).toLowerCase();
+
+    const forcedLatKey = pickKeyCI(keys, FORCE_LAT_COLUMN);
+    const forcedLngKey = pickKeyCI(keys, FORCE_LNG_COLUMN);
+    if (forcedLatKey && forcedLngKey) {
+      const lat = toNumber(rowObj[forcedLatKey]);
+      const lng = toNumber(rowObj[forcedLngKey]);
+      if (isFiniteLat(lat) && isFiniteLng(lng)) return [lat, lng];
+    }
+
+    const latKeyCandidates = keys.filter(k =>
+      /(^(lat|latitude|latitudine|y|n|north|nord)([^a-z0-9]|$))/.test(lower(k)) ||
+      /(^|[^a-z0-9])(lat|latitude|latitudine)([^a-z0-9]|$)/.test(lower(k))
+    );
+
+    const lngKeyCandidates = keys.filter(k =>
+      /(^(lng|lon|long|longitude|longitudine|x|e|east|est)([^a-z0-9]|$))/.test(lower(k)) ||
+      /(^|[^a-z0-9])(lng|lon|long|longitude|longitudine)([^a-z0-9]|$)/.test(lower(k))
+    );
+
+    let lat = null, lng = null;
+
+    if (latKeyCandidates.length) {
+      for (const k of latKeyCandidates) {
+        const n = toNumber(rowObj[k]);
+        if (isFiniteLat(n)) { lat = n; break; }
+      }
+    }
+    if (lngKeyCandidates.length) {
+      for (const k of lngKeyCandidates) {
+        const n = toNumber(rowObj[k]);
+        if (isFiniteLng(n)) { lng = n; break; }
+      }
+    }
+    if (lat !== null && lng !== null) return [lat, lng];
+
+    const vals = [];
+    for (const k of keys) {
+      const raw = rowObj[k];
+      const n = toNumber(raw);
+      if (n === null) continue;
+      vals.push({ key: k, n, raw: String(raw) });
+    }
+
+    let best = null;
+    for (let i = 0; i < vals.length; i++) {
+      for (let j = 0; j < vals.length; j++) {
+        if (i === j) continue;
+        const a = vals[i], b = vals[j];
+        if (!isFiniteLat(a.n) || !isFiniteLng(b.n)) continue;
+
+        let score = 0;
+        if (/[.,]\d+/.test(a.raw)) score += 2;
+        if (/[.,]\d+/.test(b.raw)) score += 2;
+        if (Math.abs(a.n) > 1) score += 1;
+        if (Math.abs(b.n) > 1) score += 1;
+        if (Math.abs(a.n) >= 10 && Math.abs(a.n) <= 80) score += 1;
+
+        if (!best || score > best.score) best = { lat: a.n, lng: b.n, score };
+      }
+    }
+    if (best) return [best.lat, best.lng];
+    return null;
+  }
+
+  function extractAllLatLngPairsFromRow(rowObj) {
+    const keys = Object.keys(rowObj || {});
+    const pairs = {};
+
+    function setPair(suffix, type, value) {
+      const s = (suffix || "").toLowerCase();
+      if (!pairs[s]) pairs[s] = {};
+      pairs[s][type] = value;
+    }
+
+    for (const key of keys) {
+      const lk = String(key).trim().toLowerCase();
+      const v = toNumber(rowObj[key]);
+
+      let m = lk.match(/^(lat|latitude|latitudine|y|n|north|nord)[\s_\-:]*([a-z0-9]+)?$/);
+      if (m) { setPair(m[2] || "", "lat", v); continue; }
+
+      m = lk.match(/^(lng|lon|long|longitude|longitudine|x|e|east|est)[\s_\-:]*([a-z0-9]+)?$/);
+      if (m) { setPair(m[2] || "", "lng", v); continue; }
+    }
+
+    const out = [];
+    for (const suf of Object.keys(pairs)) {
+      const p = pairs[suf];
+      if (isFiniteLat(p.lat) && isFiniteLng(p.lng)) out.push([p.lat, p.lng]);
+    }
+    return out;
+  }
+
+  function computeBounds(points) {
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    for (const p of points) {
+      const lat = p[0], lng = p[1];
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
+      minLng = Math.min(minLng, lng);
+      maxLng = Math.max(maxLng, lng);
+    }
+    if (!Number.isFinite(minLat) || !Number.isFinite(minLng)) return null;
+    return L.latLngBounds([minLat, minLng], [maxLat, maxLng]);
+  }
+
+  function makePinMarker(centerLatLng) {
+    const icon = L.divIcon({
+      className: "",
+      html: '<div class="img-pin" aria-label="Localizzazione immagine"><div class="pulse"></div><div class="pin"></div></div>',
+      iconSize: [28, 28],
+      iconAnchor: [14, 28] // bottom-center
+    });
+    return L.marker(centerLatLng, { icon, interactive: true, keyboard: true }).setZIndexOffset(1000);
+  }
+
+  function applyExtraZoom(extra) {
+    const z = map.getZoom();
+    const target = Math.min(z + extra, map.getMaxZoom());
+    map.setZoom(target);
+  }
+
+  let overlay = null;
+  let overlayBounds = null;
+  let pinMarker = null;
+  let userOpacity = DEFAULT_OPACITY;
+
+  function readStoredOpacity() {
+    try {
+      const v = localStorage.getItem(OPACITY_STORAGE_KEY);
+      const n = v !== null ? Number(v) : null;
+      if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+    } catch (_) {}
+    return DEFAULT_OPACITY;
+  }
+
+  function storeOpacity(v) {
+    try { localStorage.setItem(OPACITY_STORAGE_KEY, String(v)); } catch (_) {}
+  }
+
+  function overlayPixelSize() {
+    if (!overlayBounds) return { w: 0, h: 0 };
+    const nw = overlayBounds.getNorthWest();
+    const se = overlayBounds.getSouthEast();
+    const p1 = map.latLngToLayerPoint(nw);
+    const p2 = map.latLngToLayerPoint(se);
+    return { w: Math.abs(p2.x - p1.x), h: Math.abs(p2.y - p1.y) };
+  }
+
+  function zoomToOverlay(animate = true) {
+    if (!overlayBounds) return;
+    const targetBounds = overlayBounds.pad(0.05);
+    const opts = { padding: [40, 40] };
+
+    if (animate) map.flyToBounds(targetBounds, opts);
+    else map.fitBounds(targetBounds, opts);
+
+    map.once("moveend", () => applyExtraZoom(EXTRA_ZOOM_ON_LOCATE));
+  }
+
+  function updatePinVisibility() {
+    if (!overlay || !overlayBounds || !pinMarker) return;
+
+    if (!map.hasLayer(overlay)) {
+      if (map.hasLayer(pinMarker)) map.removeLayer(pinMarker);
+      return;
+    }
+
+    if (PIN_ALWAYS_VISIBLE) {
+      if (!map.hasLayer(pinMarker)) pinMarker.addTo(map);
+      return;
+    }
+
+    const s = overlayPixelSize();
+    const isSmall = (s.w < PIN_SHOW_THRESHOLD_PX || s.h < PIN_SHOW_THRESHOLD_PX);
+
+    if (isSmall) {
+      if (!map.hasLayer(pinMarker)) pinMarker.addTo(map);
+    } else {
+      if (map.hasLayer(pinMarker)) map.removeLayer(pinMarker);
+    }
+  }
+
+  const LocateImageControl = L.Control.extend({
+    options: { position: "topleft" },
+    onAdd: function() {
+      const container = L.DomUtil.create("div", "leaflet-bar locate-image");
+      const a = L.DomUtil.create("a", "", container);
+      a.href = "#";
+      a.title = "Vai all'immagine (fit)";
+      a.setAttribute("aria-label", "Vai all'immagine");
+      a.innerHTML = "⌖";
+
+      L.DomEvent.disableClickPropagation(container);
+      L.DomEvent.on(a, "click", (e) => {
+        L.DomEvent.preventDefault(e);
+        zoomToOverlay(true);
+      });
+      return container;
+    }
+  });
+  map.addControl(new LocateImageControl());
+
+  const OpacityControl = L.Control.extend({
+    options: { position: "topright" },
+    onAdd: function() {
+      const container = L.DomUtil.create("div", "leaflet-control opacity-slider");
+      const row = L.DomUtil.create("div", "row", container);
+
+      const label = L.DomUtil.create("span", "", row);
+      label.textContent = "Opacità";
+
+      const input = L.DomUtil.create("input", "", row);
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.01";
+
+      const val = L.DomUtil.create("span", "val", row);
+      val.textContent = "";
+
+      L.DomEvent.disableClickPropagation(container);
+      L.DomEvent.disableScrollPropagation(container);
+
+      userOpacity = readStoredOpacity();
+      input.value = String(userOpacity);
+      val.textContent = Math.round(userOpacity * 100) + "%";
+
+      input.addEventListener("input", () => {
+        const v = Number(input.value);
+        if (!Number.isFinite(v)) return;
+        userOpacity = Math.max(0, Math.min(1, v));
+        val.textContent = Math.round(userOpacity * 100) + "%";
+        if (overlay) overlay.setOpacity(userOpacity);
+        storeOpacity(userOpacity);
+      });
+
+      container._sync = () => {
+        input.value = String(userOpacity);
+        val.textContent = Math.round(userOpacity * 100) + "%";
+        if (overlay) overlay.setOpacity(userOpacity);
+      };
+
+      return container;
+    }
+  });
+  const opacityCtl = new OpacityControl();
+  map.addControl(opacityCtl);
+
+  function onResize() {
+    map.invalidateSize();
+    updatePinVisibility();
+  }
+  window.addEventListener("resize", onResize);
+  window.addEventListener("orientationchange", onResize);
+
+  map.on("zoomend moveend", updatePinVisibility);
+  map.on("overlayadd overlayremove", updatePinVisibility);
+
+  // === Carica CSV e crea overlay ===
+  setStatus("⏳ Caricamento CSV…");
+
+  fetch(CSV_URL)
+    .then(r => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(csvText => {
+      const parsed = Papa.parse(csvText, {
+        header: true,
+        skipEmptyLines: true,
+        dynamicTyping: false
+      });
+
+      const rows = (parsed.data || []).filter(Boolean);
+      if (!rows.length) throw new Error("CSV vuoto o non leggibile.");
+
+      const keys = Object.keys(rows[0] || {});
+      const colsList = keys.map(k => `<code>${k}</code>`).join(" ");
+
+      let points = [];
+
+      if (rows.length === 1) {
+        const multi = extractAllLatLngPairsFromRow(rows[0]);
+        if (multi.length >= 2) points = multi;
+        else {
+          const p = findLatLngFromRow(rows[0]);
+          if (p) points = [p];
+        }
+      } else {
+        for (const row of rows) {
+          const p = findLatLngFromRow(row);
+          if (p) points.push(p);
+        }
+      }
+
+      points = points.filter(p => p && isFiniteLat(p[0]) && isFiniteLng(p[1]));
+      if (points.length < 2) {
+        throw new Error("Non ho trovato abbastanza coordinate valide (servono almeno 2 punti).<br>Colonne trovate: " + colsList);
+      }
+
+      overlayBounds = computeBounds(points);
+      if (!overlayBounds) throw new Error("Impossibile calcolare i bounds.");
+
+      userOpacity = readStoredOpacity();
+      overlay = L.imageOverlay(IMAGE_URL, overlayBounds, {
+        opacity: userOpacity,
+        interactive: false
+      }).addTo(map);
+
+      // Pin al centro dell'immagine (resta lì perché la lat/lng è quella del centro bounds)
+      pinMarker = makePinMarker(overlayBounds.getCenter());
+      pinMarker.on("click", () => zoomToOverlay(true));
+
+      // Layers control (solo overlay)
+      L.control.layers({ "OpenStreetMap": osm }, { "Immagine (overlay)": overlay }, {
+        collapsed: (window.innerWidth < 768)
+      }).addTo(map);
+
+      // sync slider -> overlay
+      if (opacityCtl && opacityCtl.getContainer() && opacityCtl.getContainer()._sync) {
+        opacityCtl.getContainer()._sync();
+      }
+
+      if (AUTO_FIT_ON_LOAD) zoomToOverlay(false);
+      else updatePinVisibility();
+
+      setStatus(`✅ CSV letto: <b>${points.length}</b> punti.<br>
+        Bounds: SW <code>${overlayBounds.getSouthWest().lat.toFixed(6)}, ${overlayBounds.getSouthWest().lng.toFixed(6)}</code> — 
+        NE <code>${overlayBounds.getNorthEast().lat.toFixed(6)}, ${overlayBounds.getNorthEast().lng.toFixed(6)}</code><br>
+        <span style="opacity:.85">Vista iniziale: Europa. Usa <b>⌖</b> o il pin 📍 (quando l'overlay è piccolo) per zoomare sull'immagine. Slider = opacità.</span><br>
+        <span style="opacity:.75">Colonne: ${colsList}</span>
+      `);
+    })
+    .catch(err => {
+      console.error(err);
+      setStatus(`❌ Errore nel caricamento/parsing del CSV.<br><code>${String(err.message || err)}</code>`);
+    });
+</script>
+</body>
+</html>
