@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Leaflet - Image overlay da CSV (v3)</title>
+
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+
+  <!-- PapaParse (per leggere CSV) -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; width: 100%; }
+
+    .status {
+      position: absolute;
+      z-index: 1000;
+      left: 12px;
+      bottom: 12px;
+      background: rgba(255,255,255,0.92);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font: 13px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      max-width: min(540px, calc(100% - 24px));
+    }
+    .status code { font-size: 12px; }
+
+    /* Bottone "localizza immagine" */
+    .leaflet-bar.locate-image a {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      line-height: 34px;
+      font-size: 18px;
+      text-decoration: none;
+    }
+
+    /* Pin "localizzazione" senza dipendere dalle immagini di Leaflet */
+    .img-pin {
+      position: relative;
+      width: 28px;
+      height: 28px;
+      transform: translate(-50%, -100%);
+    }
+    .img-pin .pin {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 18px;
+      height: 18px;
+      border-radius: 50% 50% 50% 0;
+      transform: translate(-50%, -50%) rotate(-45deg);
+      background: #1f78ff;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+    .img-pin .pin::after {
+      content: "";
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.95);
+      left: 5px;
+      top: 5px;
+    }
+    .img-pin .pulse {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: rgba(31,120,255,0.35);
+      animation: pulse 1.6s ease-out infinite;
+    }
+    @keyframes pulse {
+      0%   { transform: translate(-50%, -50%) scale(0.8); opacity: 0.8; }
+      100% { transform: translate(-50%, -50%) scale(3.2); opacity: 0; }
+    }
+
+    /* Su schermi piccoli, rendi la status box più discreta */
+    @media (max-width: 520px) {
+      .status {
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        max-width: unset;
+        font-size: 12px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <div class="status" id="status">
+    Caricamento CSV…<br>
+    <span style="opacity:.8">Nota: se apri questo file con <code>file://</code>, il browser potrebbe bloccare il fetch del CSV (CORS). In tal caso avvia un server locale (es. <code>python -m http.server</code>) e apri <code>http://localhost:8000</code>.</span>
+  </div>
+
+<script>
+  // === Config ===
+  const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRwWDLOGx5v58dS-6pjShy2BPFwQEHLuir-ji9j13pzUBMUEqo7ve4vr4XVxIZJBhg4uwQS-iY8UdRo/pub?gid=0&single=true&output=csv";
+
+  // Immagine overlay:
+  const IMAGE_URL = "overlay.jpg";
+
+  // Opacità overlay (quando l'immagine è "grande" sullo schermo)
+  const OVERLAY_OPACITY = 0.85;
+
+  // Se l'immagine è troppo piccola (zoom troppo out), mostra un'icona 📍 e rendi l'overlay molto trasparente
+  const PIN_SHOW_THRESHOLD_PX = 220;          // soglia in pixel: se (larghezza o altezza) < soglia => icona
+  const OVERLAY_OPACITY_WHEN_SMALL = 0.12;    // opacità overlay quando è "troppo piccolo"
+  const PIN_ALWAYS_VISIBLE = false;           // true = mostra sempre il pin
+
+  // Zoom "extra" per rendere l'immagine più leggibile
+  const EXTRA_ZOOM_ON_START = 1;              // 0 = fitBounds puro; 1 = ingrandisce un po' all'avvio
+  const EXTRA_ZOOM_ON_LOCATE = 1;             // zoom extra quando clicchi il bottone/pin
+
+  // Mostra la scala (barra metrica)
+  const SHOW_SCALE_CONTROL = true;
+
+  // --- Colonne coordinate (opzionale) ---
+  // Se hai rinominato le colonne del CSV e lo script non riesce a riconoscerle,
+  // imposta qui i nomi ESATTI delle colonne (case-insensitive). Lascia "" per auto-detect.
+  // Esempio: FORCE_LAT_COLUMN = "Latitudine"; FORCE_LNG_COLUMN = "Longitudine";
+  const FORCE_LAT_COLUMN = "";
+  const FORCE_LNG_COLUMN = "";
+
+  // === Map base ===
+  const map = L.map("map", {
+    zoomControl: true,
+    zoomSnap: 0.25,
+    zoomDelta: 0.25
+  });
+
+  const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 22,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+
+  if (SHOW_SCALE_CONTROL) {
+    L.control.scale({ position: "bottomright", metric: true, imperial: false, maxWidth: 220 }).addTo(map);
+  }
+
+  const cornersLayer = L.layerGroup().addTo(map);
+  const debugLayer = L.layerGroup().addTo(map);
+
+  function setStatus(html) {
+    document.getElementById("status").innerHTML = html;
+  }
+
+  function toNumber(v) {
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    if (!s) return null;
+    // supporto decimali con virgola (es. "45,123")
+    const normalized = s.replace(",", ".");
+    const n = Number(normalized);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function pickKeyCI(keys, wanted) {
+    if (!wanted) return null;
+    const w = String(wanted).trim().toLowerCase();
+    if (!w) return null;
+    return keys.find(k => String(k).trim().toLowerCase() === w) || null;
+  }
+
+  function isFiniteLat(n) { return Number.isFinite(n) && Math.abs(n) <= 90; }
+  function isFiniteLng(n) { return Number.isFinite(n) && Math.abs(n) <= 180; }
+
+  function findLatLngFromRow(rowObj) {
+    // rowObj è un oggetto {col: value} da PapaParse con header:true
+    const keys = Object.keys(rowObj || {});
+    const lower = (k) => String(k).toLowerCase();
+
+    // 0) Se l'utente ha forzato i nomi colonna, usa quelli (case-insensitive)
+    const forcedLatKey = pickKeyCI(keys, FORCE_LAT_COLUMN);
+    const forcedLngKey = pickKeyCI(keys, FORCE_LNG_COLUMN);
+    if (forcedLatKey && forcedLngKey) {
+      const lat = toNumber(rowObj[forcedLatKey]);
+      const lng = toNumber(rowObj[forcedLngKey]);
+      if (isFiniteLat(lat) && isFiniteLng(lng)) return [lat, lng];
+    }
+
+    // 1) auto-detect per nomi colonne comuni (IT/EN + sinonimi)
+    //    Esempi riconosciuti: lat, latitude, latitudine, y, n, north, nord
+    //                         lng, lon, long, longitude, longitudine, x, e, east, est
+    const latKeyCandidates = keys.filter(k =>
+      /(^(lat|latitude|latitudine|y|n|north|nord)([^a-z0-9]|$))/.test(lower(k)) ||
+      /(^|[^a-z0-9])(lat|latitude|latitudine)([^a-z0-9]|$)/.test(lower(k))
+    );
+
+    const lngKeyCandidates = keys.filter(k =>
+      /(^(lng|lon|long|longitude|longitudine|x|e|east|est)([^a-z0-9]|$))/.test(lower(k)) ||
+      /(^|[^a-z0-9])(lng|lon|long|longitude|longitudine)([^a-z0-9]|$)/.test(lower(k))
+    );
+
+    let lat = null, lng = null;
+
+    // 1a) prova coppia lat/lng con nomi riconosciuti
+    if (latKeyCandidates.length) {
+      for (const k of latKeyCandidates) {
+        const n = toNumber(rowObj[k]);
+        if (isFiniteLat(n)) { lat = n; break; }
+      }
+    }
+    if (lngKeyCandidates.length) {
+      for (const k of lngKeyCandidates) {
+        const n = toNumber(rowObj[k]);
+        if (isFiniteLng(n)) { lng = n; break; }
+      }
+    }
+    if (lat !== null && lng !== null) return [lat, lng];
+
+    // 2) fallback: cerca tra tutti i valori una coppia plausibile lat/lng
+    const vals = [];
+    for (const k of keys) {
+      const raw = rowObj[k];
+      const n = toNumber(raw);
+      if (n === null) continue;
+      vals.push({ key: k, n, raw: String(raw) });
+    }
+
+    // genera tutte le coppie (a,b) e scegli la più "plausibile"
+    let best = null;
+    for (let i = 0; i < vals.length; i++) {
+      for (let j = 0; j < vals.length; j++) {
+        if (i === j) continue;
+        const a = vals[i], b = vals[j];
+
+        // a=lat, b=lng
+        if (!isFiniteLat(a.n) || !isFiniteLng(b.n)) continue;
+
+        // score: preferisci valori con decimali e non troppo piccoli (per evitare id=1,2,3,4)
+        let score = 0;
+        if (/[.,]\d+/.test(a.raw)) score += 2;
+        if (/[.,]\d+/.test(b.raw)) score += 2;
+        if (Math.abs(a.n) > 1) score += 1;
+        if (Math.abs(b.n) > 1) score += 1;
+        // bonus se range tipico geografico (lat tra 10 e 80) – leggero
+        if (Math.abs(a.n) >= 10 && Math.abs(a.n) <= 80) score += 1;
+
+        if (!best || score > best.score) {
+          best = { lat: a.n, lng: b.n, score };
+        }
+      }
+    }
+    if (best) return [best.lat, best.lng];
+
+    return null;
+  }
+
+  // Se il CSV ha una sola riga con più coppie (es. lat_sw,lng_sw,lat_ne,lng_ne, ...),
+  // prova a estrarle tutte.
+  function extractAllLatLngPairsFromRow(rowObj) {
+    const keys = Object.keys(rowObj || {});
+    const pairs = {}; // suffix -> {lat, lng}
+
+    function setPair(suffix, type, value) {
+      const s = (suffix || "").toLowerCase();
+      if (!pairs[s]) pairs[s] = {};
+      pairs[s][type] = value;
+    }
+
+    for (const key of keys) {
+      const lk = String(key).trim().toLowerCase();
+      const v = toNumber(rowObj[key]);
+
+      // match lat-ish: lat, latitude, latitudine, y, n, nord, north
+      let m = lk.match(/^(lat|latitude|latitudine|y|n|north|nord)[\s_\-:]*([a-z0-9]+)?$/);
+      if (m) {
+        setPair(m[2] || "", "lat", v);
+        continue;
+      }
+
+      // match lng-ish: lng, lon, long, longitude, longitudine, x, e, east, est
+      m = lk.match(/^(lng|lon|long|longitude|longitudine|x|e|east|est)[\s_\-:]*([a-z0-9]+)?$/);
+      if (m) {
+        setPair(m[2] || "", "lng", v);
+        continue;
+      }
+    }
+
+    const out = [];
+    for (const suf of Object.keys(pairs)) {
+      const p = pairs[suf];
+      if (isFiniteLat(p.lat) && isFiniteLng(p.lng)) out.push([p.lat, p.lng]);
+    }
+
+    return out;
+  }
+
+  function computeBounds(points) {
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    for (const p of points) {
+      const lat = p[0], lng = p[1];
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
+      minLng = Math.min(minLng, lng);
+      maxLng = Math.max(maxLng, lng);
+    }
+    if (!Number.isFinite(minLat) || !Number.isFinite(minLng)) return null;
+    return L.latLngBounds([minLat, minLng], [maxLat, maxLng]); // SW, NE
+  }
+
+  function addCornerMarkers(points) {
+    cornersLayer.clearLayers();
+    points.forEach((p, idx) => {
+      const m = L.circleMarker(p, { radius: 5 });
+      m.bindPopup(`<b>Punto ${idx + 1}</b><br>lat: ${p[0]}<br>lng: ${p[1]}`);
+      m.addTo(cornersLayer);
+    });
+  }
+
+  function makePinMarker(centerLatLng) {
+    const icon = L.divIcon({
+      className: "",
+      html: '<div class="img-pin" aria-label="Localizzazione immagine"><div class="pulse"></div><div class="pin"></div></div>',
+      iconSize: [28, 28],
+      iconAnchor: [14, 28]
+    });
+
+    const marker = L.marker(centerLatLng, {
+      icon,
+      keyboard: false,
+      title: "Vai all'immagine"
+    });
+
+    return marker;
+  }
+
+  function bootstrapFromCsv(csvText) {
+    const parsed = Papa.parse(csvText, {
+      header: true,
+      skipEmptyLines: true
+    });
+
+    if (parsed.errors && parsed.errors.length) {
+      console.warn("CSV parse errors:", parsed.errors);
+    }
+
+    const rows = parsed.data || [];
+    const points = [];
+    const seen = new Set();
+
+    function addPoint(latlng) {
+      if (!latlng) return;
+      const key = `${latlng[0]},${latlng[1]}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      points.push(latlng);
+    }
+
+    for (const row of rows) {
+      const latlng = findLatLngFromRow(row);
+      addPoint(latlng);
+    }
+
+    // Se abbiamo letto <2 punti, prova a estrarre più coppie dalla prima riga
+    // (formato: lat_sw,lng_sw,lat_ne,lng_ne,...)
+    if (points.length < 2 && rows.length) {
+      const extra = extractAllLatLngPairsFromRow(rows[0]);
+      extra.forEach(addPoint);
+    }
+
+    if (points.length < 2) {
+      const fields = (parsed.meta && parsed.meta.fields) ? parsed.meta.fields : Object.keys(rows[0] || {});
+      setStatus(`⚠️ Non riesco a estrarre coordinate valide dal CSV.<br><br>
+        <b>Colonne trovate:</b> <code>${(fields && fields.length) ? fields.join(", ") : "(nessuna)"}</code><br><br>
+        Come risolvere:<br>
+        • rinomina le colonne a <code>lat</code>/<code>lng</code> (o <code>latitude</code>/<code>longitude</code>)<br>
+        • oppure imposta in alto <code>FORCE_LAT_COLUMN</code> e <code>FORCE_LNG_COLUMN</code> con i nomi esatti<br>
+        • se hai una sola riga con più coppie (es. <code>lat_sw,lng_sw,lat_ne,lng_ne</code>), il file v3 prova a estrarle automaticamente.<br><br>
+        CSV: <code>${CSV_URL}</code>`);
+      return;
+    }
+
+    const bounds = computeBounds(points);
+    if (!bounds) {
+      setStatus(`⚠️ Coordinate lette, ma bounds non calcolabili. Controlla i valori nel CSV.`);
+      return;
+    }
+
+    // Overlay immagine
+    const overlay = L.imageOverlay(IMAGE_URL, bounds, {
+      opacity: OVERLAY_OPACITY,
+      interactive: true,
+      crossOrigin: true
+    });
+
+    overlay.on("error", () => {
+      setStatus(`⚠️ Impossibile caricare l'immagine dell'overlay.<br>
+        Se usi la versione con immagine esterna, metti <code>overlay.jpg</code> nella stessa cartella di questo HTML (oppure modifica <code>IMAGE_URL</code>).`);
+    });
+
+    overlay.addTo(map);
+
+    // Debug: rettangolo bounds
+    const rect = L.rectangle(bounds, { weight: 1 });
+    rect.addTo(debugLayer);
+
+    // Marker ai punti letti dal CSV (utile per verificare)
+    addCornerMarkers(points);
+
+    // --- Controllo "localizza immagine" + pin quando zoom-out ---
+    const center = bounds.getCenter();
+    const pinMarker = makePinMarker(center);
+
+    function overlayPixelSize() {
+      // Usa containerPoint (dimensioni sullo schermo)
+      const nw = map.latLngToContainerPoint(bounds.getNorthWest());
+      const se = map.latLngToContainerPoint(bounds.getSouthEast());
+      return {
+        w: Math.abs(se.x - nw.x),
+        h: Math.abs(se.y - nw.y)
+      };
+    }
+
+    function applyExtraZoom(extra) {
+      if (!extra) return;
+      const z = map.getZoom();
+      const target = Math.min(z + extra, map.getMaxZoom());
+      map.setZoom(target);
+    }
+
+    function zoomToOverlay(animate = true) {
+      const targetBounds = bounds.pad(0.05);
+      const opts = { padding: [40, 40] };
+
+      if (animate) {
+        map.flyToBounds(targetBounds, opts);
+      } else {
+        map.fitBounds(targetBounds, opts);
+      }
+
+      map.once("moveend", () => applyExtraZoom(EXTRA_ZOOM_ON_LOCATE));
+    }
+
+    // Pin click => zoom
+    pinMarker.on("click", () => zoomToOverlay(true));
+
+    function updateOverlayResponsiveness() {
+      if (PIN_ALWAYS_VISIBLE) {
+        if (!map.hasLayer(pinMarker)) pinMarker.addTo(map);
+        overlay.setOpacity(OVERLAY_OPACITY);
+        return;
+      }
+
+      const s = overlayPixelSize();
+      const isSmall = (s.w < PIN_SHOW_THRESHOLD_PX || s.h < PIN_SHOW_THRESHOLD_PX);
+
+      if (isSmall) {
+        // overlay troppo piccolo: rendilo quasi trasparente e mostra il pin
+        overlay.setOpacity(OVERLAY_OPACITY_WHEN_SMALL);
+        if (!map.hasLayer(pinMarker)) pinMarker.addTo(map);
+      } else {
+        overlay.setOpacity(OVERLAY_OPACITY);
+        if (map.hasLayer(pinMarker)) map.removeLayer(pinMarker);
+      }
+    }
+
+    map.on("zoomend moveend", updateOverlayResponsiveness);
+
+    // Controllo (bottone) per tornare subito all'immagine
+    const LocateImageControl = L.Control.extend({
+      options: { position: "topleft" },
+      onAdd: function() {
+        const container = L.DomUtil.create("div", "leaflet-bar locate-image");
+        const a = L.DomUtil.create("a", "", container);
+        a.href = "#";
+        a.title = "Vai all'immagine (fit)";
+        a.setAttribute("aria-label", "Vai all'immagine");
+        a.innerHTML = "⌖";
+        L.DomEvent.disableClickPropagation(container);
+        L.DomEvent.on(a, "click", (e) => {
+          L.DomEvent.preventDefault(e);
+          zoomToOverlay(true);
+        });
+        return container;
+      }
+    });
+    map.addControl(new LocateImageControl());
+
+    // Inquadratura iniziale
+    map.fitBounds(bounds.pad(0.05));
+    map.once("moveend", () => {
+      applyExtraZoom(EXTRA_ZOOM_ON_START);
+      updateOverlayResponsiveness();
+    });
+
+    // Layers control: su mobile collassa di default
+    const overlayLayers = {
+      "Immagine (overlay)": overlay,
+      "Punti dal CSV": cornersLayer,
+      "Bounds (debug)": debugLayer
+    };
+
+    L.control.layers({ "OpenStreetMap": osm }, overlayLayers, { collapsed: (window.innerWidth < 768) }).addTo(map);
+
+    setStatus(`✅ CSV letto: <b>${points.length}</b> punti.<br>
+      Bounds calcolati: <br>
+      SW: <code>${bounds.getSouthWest().lat.toFixed(6)}, ${bounds.getSouthWest().lng.toFixed(6)}</code><br>
+      NE: <code>${bounds.getNorthEast().lat.toFixed(6)}, ${bounds.getNorthEast().lng.toFixed(6)}</code><br>
+      <span style="opacity:.8">Suggerimento: se zoommi troppo out, apparirà un pin 📍 cliccabile per tornare sull'immagine.</span><br>
+      <span style="opacity:.8">CSV: <code>${CSV_URL}</code></span>`);
+  }
+
+  // Carica CSV
+  fetch(CSV_URL)
+    .then(r => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    })
+    .then(csvText => bootstrapFromCsv(csvText))
+    .catch(err => {
+      console.error(err);
+      setStatus(`⚠️ Errore nel fetch del CSV.<br>
+        Motivo: <code>${String(err)}</code><br><br>
+        Possibili cause:<br>
+        • CORS se stai aprendo l'HTML con <code>file://</code> (usa un server locale).<br>
+        • URL non pubblicato o non accessibile.<br><br>
+        CSV: <code>${CSV_URL}</code>`);
+    });
+
+  // Migliora la resa responsive quando cambia dimensione finestra/orientamento
+  window.addEventListener("resize", () => {
+    map.invalidateSize();
+  });
+</script>
+</body>
+</html>
